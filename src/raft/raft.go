@@ -22,6 +22,7 @@ import (
 	"labrpc"
 	"time"
 	"math/rand"
+	"fmt"
 )
 
 // import "bytes"
@@ -106,10 +107,10 @@ func (rf *Raft) GetState() (int, bool) {
 	var term int
 	var isleader bool
 	// Your code here (2A).
-	DPrintf("getState:%t\n")
+	//DPrintf("%d getState:%t\n",rf.me,)
 	term = rf.currentTerm
 	isleader = rf.IsLeader()
-	DPrintf("getState:%t\n",isleader)
+	DPrintf("%d getState:%t\n",rf.me,isleader)
 	return term, isleader
 }
 
@@ -250,11 +251,11 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 //
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
 	//DPrintf("11-sendRequestVote to server(%d) %d:\n",rf.me,server)
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
+
 	DPrintf("sendRequestVote: server(%d)  send vote req to %d at term %d\n",rf.me,server,args.Term)
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
-
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	if ok {
 		if reply.VoteGranted {
 			rf.vote_counter++
@@ -339,6 +340,7 @@ func (rf *Raft) AppendEntryHandler(args *AppendEntryReq,reply *AppendEntryReply)
 	reply.Term = rf.currentTerm
 	reply.Success = true
 	if args ==nil{
+		DPrintf("%d args is null\n",rf.me)
 		panic(args)
 	}
 	if args.Term < rf.currentTerm{
@@ -347,11 +349,12 @@ func (rf *Raft) AppendEntryHandler(args *AppendEntryReq,reply *AppendEntryReply)
 		return
 	}
 	rf.chanHb<-true
-	reply.Term = args.Term
+	reply.Term = rf.currentTerm
 
-	//发送后面剩下的，从新加入的node
+	//发送后面剩下的，重新加入的node
 	if args.PreLogIndex > rf.getLastIndex() {
 		reply.NextIndex = rf.getLastIndex() + 1
+		DPrintf("%d leader prelogindex%d < rf.getlastindex %d",rf.me,args.PreLogIndex,rf.getLastIndex())
 		return
 	}
 
@@ -375,8 +378,15 @@ func (rf *Raft) AppendEntryHandler(args *AppendEntryReq,reply *AppendEntryReply)
 	//	}
 	//
 	//}
-	rf.logs = append(rf.logs,args.Entries...)
-	DPrintf("%d lastapply id is %d",rf.me,rf.getLastIndex())
+	//DPrintf("%d logs length is %d %d\n",rf.me,len(args.Entries),args.Entries)
+	DPrintf("%d RECV %v\n",rf.me,args)
+	if args.PreLogIndex == rf.getLastIndex() && args.PrevLogTerm == rf.getLastTerm(){
+		if len(args.Entries) >0{
+			DPrintf("%d append new %d entry",rf.me,len(args.Entries))
+			rf.logs = append(rf.logs,args.Entries...)
+		}
+	}
+	//DPrintf("%d lastapply id is len %d -%d",rf.me,len(rf.logs),rf.getLastIndex())
 	//DPrintf("append log  %d to %d",ele.LogIndex,rf.me)
 	if args.LeaderCommit > rf.commitIndex {
 		if args.LeaderCommit >rf.getLastIndex(){
@@ -386,17 +396,22 @@ func (rf *Raft) AppendEntryHandler(args *AppendEntryReq,reply *AppendEntryReply)
 		}
 		rf.chanCommit<-true
 	}
+	reply.NextIndex = rf.getLastIndex()+1
+	reply.Success =true
 	//DPrintf("get hb and write to chanHb for serve %d",rf.me)
 
 }
-func (rf *Raft) sendAppendEntry(server int, args *AppendEntryReq, reply *AppendEntryReply) bool {
-	rf.lockAppendEntry.Lock()
-	defer rf.lockAppendEntry.Unlock()
+func (rf *Raft) sendAppendEntry(server int, args AppendEntryReq, reply *AppendEntryReply) bool {
+
 	if rf.state != STATE_LEADER{
+		DPrintf("%d is not leader state =%d",rf.me,rf.state)
 		return false;
 	}
-	DPrintf("LEADER:(%d) sendHB to %d at %d\n",rf.me,server,time.Now().Nanosecond())
-	ok := rf.peers[server].Call("Raft.AppendEntryHandler", args, reply)
+	//DPrintf("LEADER:(%d) sendHB to %d at %d\n",rf.me,server,time.Now().Nanosecond())
+	DPrintf("%d SEND TO %d :%v\n",rf.me,server,args)
+	ok := rf.peers[server].Call("Raft.AppendEntryHandler", &args, reply)
+	rf.lockAppendEntry.Lock()
+	defer rf.lockAppendEntry.Unlock()
 	if ok{
 		if reply.Term >rf.currentTerm{
 			rf.votedFor = -1
@@ -405,26 +420,23 @@ func (rf *Raft) sendAppendEntry(server int, args *AppendEntryReq, reply *AppendE
 			DPrintf("%d change state to follower\n",rf.me)
 			return ok
 		}
-		if reply.Success{
-			if len(args.Entries) >0{
-				rf.nextIndexs[server] = args.Entries[len(args.Entries) -1].LogIndex +1
-				rf.matchIndexs[server] =args.Entries[len(args.Entries) -1].LogIndex
+		if reply.Success {
+			if len(args.Entries) > 0 {
+				DPrintf("%d %d nextIndex %d",rf.me,server,reply.NextIndex)
+				rf.nextIndexs[server] = reply.NextIndex
+				//reply.NextIndex
+				//rf.nextIndex[server] = reply.NextIndex
+				rf.matchIndexs[server] = rf.nextIndexs[server] - 1
 			}
+		} else {
+			rf.nextIndexs[server] = reply.NextIndex
+			rf.matchIndexs[server] = rf.nextIndexs[server] - 1
 		}
 	}
-
+	DPrintf("%d SEND to %d completed",rf.me,server)
 	return ok
 }
-type Command interface {
-	execute(cmd string) bool
-}
 
-type CmdAppendEntry struct {
-	cmd string
-}
-func (cmd *CmdAppendEntry) execute(cmdStr string){
-	DPrintf("cmd %s\n",cmdStr)
-}
 
 
 func (rf *Raft) broadAppendEntries(){
@@ -432,10 +444,10 @@ func (rf *Raft) broadAppendEntries(){
 	newCommitIdx:=rf.commitIndex
 	baseIdx :=rf.logs[0].LogIndex
 	last :=rf.getLastIndex()
-	for i:=rf.commitIndex;i<last;i++{
+	for i:=rf.commitIndex;i<=last;i++{
 		num:=1
 		for j:= range rf.peers{
-			if j!= rf.me && rf.matchIndexs[j] >i && rf.logs[i -baseIdx].LogTerm == rf.currentTerm{
+			if j!= rf.me && rf.matchIndexs[j] >=i && rf.logs[i -baseIdx].LogTerm == rf.currentTerm{
 				num++
 			}
 		}
@@ -446,6 +458,7 @@ func (rf *Raft) broadAppendEntries(){
 	if newCommitIdx != rf.commitIndex{
 		rf.commitIndex = newCommitIdx
 		rf.chanCommit <-true
+		DPrintf("%d docommit to %d\n",rf.me,rf.commitIndex)
 	}
 	for idx,_ :=range rf.peers{
 		if idx == rf.me{
@@ -456,12 +469,16 @@ func (rf *Raft) broadAppendEntries(){
 			var args AppendEntryReq
 			args.Term = rf.currentTerm;
 			args.LeaderCommit = rf.commitIndex
-			args.PreLogIndex = rf.nextIndexs[idx]-1
+			args.PreLogIndex = rf.nextIndexs[peerIdx]-1
 			args.PrevLogTerm = rf.logs[args.PreLogIndex].LogTerm
-			args.Entries = make([]logEntry,rf.getLastIndex()-args.PreLogIndex)
-			copy(args.Entries,rf.logs[args.PreLogIndex:])
+			args.LeaderId = rf.me
+			//rf.getLastIndex()-args.PreLogIndex
+			DPrintf("appendEntry:%d -%d nextId %d\n",rf.me,peerIdx,rf.nextIndexs[peerIdx])
+			args.Entries = make([]logEntry,len(rf.logs[args.PreLogIndex + 1:]))
+			copy(args.Entries,rf.logs[args.PreLogIndex+1:])
+			//DPrintf("args :%v\n",args)
 			var reply AppendEntryReply
-			rf.sendAppendEntry(peerIdx,&args,&reply)
+			rf.sendAppendEntry(peerIdx,args,&reply)
 
 		}(idx)
 	}
@@ -484,11 +501,12 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		entry.LogIndex=rf.getLastIndex()+1
 		entry.LogTerm = rf.currentTerm
 		rf.logs = append(rf.logs,entry)
-		DPrintf("%d Start to get a command length of logs %d",rf.me,len(rf.logs));
+		DPrintf("%d ADD %v\n",rf.me,entry)
 	}
 
 
 	term = rf.currentTerm
+	fmt.Printf("%d ,index=%d ,term=%d,isLeader=%t\n",rf.me,index,term,isLeader)
 	return index, term, isLeader
 }
 
@@ -528,13 +546,16 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.lastApplied = 0
 	rf.state = 0 //0: follower ;1 :candidated;2:leader
 	rf.votedFor = -1
-	rf.logs = append(rf.logs,logEntry{LogTerm:rf.currentTerm,LogIndex:rf.lastApplied,LogComd:CmdAppendEntry{"cmd"}})
+	rf.logs = append(rf.logs,logEntry{LogTerm:rf.currentTerm,LogIndex:rf.lastApplied,LogComd:100})
 	rf.chanGrantVote = make(chan bool,100)
 	rf.chanHb = make(chan bool,100)
 	rf.chanLeader = make(chan bool,100)
+	rf.chanCommit=make(chan bool,100)
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
+
+
 
 	go func(server *Raft){
 		for{
@@ -576,7 +597,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 					server.state = STATE_LEADER
 					rf.nextIndexs = make([]int,len(rf.peers))
 					rf.matchIndexs = make([]int,len(rf.peers))
-					for idx,_ := range server.nextIndexs{
+					for idx,_ := range server.peers{
 						server.nextIndexs[idx] = server.getLastIndex()+1
 						server.matchIndexs[idx] =0
 					}
@@ -591,19 +612,23 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		}
 	}(rf)
 	go func(){
-		select {
-		case <-rf.chanCommit:
-			rf.mu.Lock()
-			commitIndex := rf.commitIndex
-			baseIndex := rf.logs[0].LogIndex
-			for i := rf.lastApplied+1; i <= commitIndex; i++ {
-				msg := ApplyMsg{Index: i, Command: rf.logs[i-baseIndex].LogComd}
-				applyCh <- msg
-				//fmt.Printf("me:%d %v\n",rf.me,msg)
-				rf.lastApplied = i
+		for{
+			select {
+			case <-rf.chanCommit:
+				rf.mu.Lock()
+				commitIndex := rf.commitIndex
+				baseIndex := rf.logs[0].LogIndex
+				for i := rf.lastApplied+1; i <= commitIndex; i++ {
+					msg := ApplyMsg{Index: i, Command: rf.logs[i-baseIndex].LogComd}
+					applyCh <- msg
+					//fmt.Printf("me:%d %v\n",rf.me,msg)
+					rf.lastApplied = i
+					DPrintf("APPLY %d apply msg %v",rf.me,msg)
+				}
+				rf.mu.Unlock()
 			}
-			rf.mu.Unlock()
 		}
+
 	}()
 
 
